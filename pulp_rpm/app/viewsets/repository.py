@@ -6,7 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.serializers import ValidationError as DRFValidationError
 
 from pulpcore.plugin.actions import ModifyRepositoryActionMixin
-from pulpcore.plugin.models import ContentArtifact, RepositoryVersion
+from pulpcore.plugin.models import ContentArtifact, Remote, RepositoryVersion
 from pulpcore.plugin.serializers import (
     AsyncOperationResponseSerializer,
     RepositoryAddRemoveContentSerializer,
@@ -246,6 +246,19 @@ class RpmRepositoryViewSet(RepositoryViewSet, RpmModifyRepositoryActionMixin, Ro
 
         if not sync_policy:
             sync_policy = SYNC_POLICIES.ADDITIVE if not mirror else SYNC_POLICIES.MIRROR_COMPLETE
+
+        # Signing on sync needs every package downloaded and metadata that Pulp generates.
+        if repository.package_signing_service and repository.package_signing_fingerprint:
+            if remote.policy != Remote.IMMEDIATE:
+                raise DRFValidationError(
+                    "A repository with a package signing service can only be synced from a "
+                    "remote with the 'immediate' policy."
+                )
+            if sync_policy == SYNC_POLICIES.MIRROR_COMPLETE:
+                raise DRFValidationError(
+                    "Cannot use 'mirror_complete' sync policy when repository has a package "
+                    "signing service."
+                )
 
         # validate some invariants that involve repository-wide settings.
         if sync_policy in (SYNC_POLICIES.MIRROR_COMPLETE, SYNC_POLICIES.MIRROR_CONTENT_ONLY):
