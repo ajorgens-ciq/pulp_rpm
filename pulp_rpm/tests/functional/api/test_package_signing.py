@@ -1,5 +1,7 @@
+import hashlib
 import shutil
 import subprocess
+import uuid
 
 import gnupg
 import pytest
@@ -1142,6 +1144,274 @@ def pqc_package_signing_service(tmp_path, has_rpmv6_support, pulpcore_bindings):
     service = pulpcore_bindings.SigningServicesApi.list(name=service_name).results[0]
     yield service, fingerprint
     remove_signing_service(service_name, service_class="rpm:RpmPackageSigningService")
+
+
+def _rpmsign(rpm_path, gpg_homedir, key):
+    """Sign like a build system does: rpmsign with GnuPG, into the legacy signature tags."""
+    subprocess.run(
+        [
+            "rpmsign",
+            "--define",
+            f"_gpg_path {gpg_homedir}",
+            "--define",
+            f"_gpg_name {key.signing_fingerprint}",
+            "--addsign",
+            str(rpm_path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+
+@pytest.fixture
+def upstream_repo_factory(tmp_path, signing_gpg_extra, signing_gpg_homedir_path):
+    """Build a local upstream repo of real RPMs, optionally pre-signed with a test key."""
+
+    def _factory(names, key=None):
+        base_path = str(uuid.uuid4())
+        repo_dir = tmp_path / base_path
+        repo_dir.mkdir()
+        rpm_paths = []
+        for name in names:
+            rpm_path = repo_dir / f"{name}-1.0-1.noarch.rpm"
+            build_rpm(Nevra(name, 0, "1.0", "1", "noarch"), rpm_path)
+            if key:
+                _rpmsign(rpm_path, signing_gpg_homedir_path, key)
+            rpm_paths.append(rpm_path)
+        remote_repo = RepositoryBuilder(tmp_path).build_from_files(rpm_paths, base_path=base_path)
+        sha256s = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in rpm_paths}
+        return remote_repo.url, sha256s
+
+    return _factory
+
+
+@pytest.fixture
+def sync_signing_repo(
+    signing_gpg_extra, rpm_package_signing_service_resign, rpm_repository_factory
+):
+    """A repository that re-signs synced packages with the rsa4k key (rsa2k plays upstream)."""
+    _, key_b = signing_gpg_extra
+    fingerprint = f"v4:{key_b.signing_fingerprint.upper()}"
+    repository = rpm_repository_factory(
+        package_signing_service=rpm_package_signing_service_resign.pulp_href,
+        package_signing_fingerprint=fingerprint,
+    )
+    return repository, fingerprint
+
+
+def _list_packages(rpm_package_api, repository):
+    return {
+        pkg.location_href: pkg
+        for pkg in rpm_package_api.list(repository_version=repository.latest_version_href).results
+    }
+
+
+@pytest.mark.parallel
+@pytest.mark.parametrize("sync_policy", ["additive", "mirror_content_only"])
+def test_sign_packages_on_sync(
+    sync_policy,
+    rpm_verifier_factory,
+    tmp_path,
+    download_content_unit,
+    init_and_sync,
+    upstream_repo_factory,
+    sync_signing_repo,
+    rpm_package_api,
+    rpm_publication_factory,
+    rpm_distribution_factory,
+):
+    """Sync re-signs upstream packages with the repository's key, replacing upstream's."""
+    url, upstream_sha256s = upstream_repo_factory(["walrus", "zebra"], KEY_V4_RSA2K)
+    repository, fingerprint = sync_signing_repo
+
+    repository, _ = init_and_sync(repository=repository, url=url, sync_policy=sync_policy)
+
+    packages = _list_packages(rpm_package_api, repository)
+    assert sorted(packages) == sorted(upstream_sha256s)
+    for filename, package in packages.items():
+        assert package.signing_keys == [fingerprint]
+        assert package.pkg_id != upstream_sha256s[filename]
+
+    publication = rpm_publication_factory(repository=repository.pulp_href)
+    distribution = rpm_distribution_factory(publication=publication.pulp_href)
+    served = tmp_path / "served.rpm"
+    served.write_bytes(
+        download_content_unit(
+            distribution.base_path, get_package_repo_path("walrus-1.0-1.noarch.rpm")
+        )
+    )
+    rpm_rs.Package.open(str(served)).verify_signature(rpm_verifier_factory(KEY_V4_RSA4K))
+    assert [
+        f"v4:{s.fingerprint.upper()}" for s in rpm_rs.PackageMetadata.open(str(served)).signatures()
+    ] == [fingerprint]
+
+
+@pytest.mark.parallel
+def test_sign_on_sync_resync_is_stable(
+    init_and_sync,
+    upstream_repo_factory,
+    sync_signing_repo,
+    rpm_package_api,
+    rpm_rpmremote_factory,
+):
+    """A second, unoptimized sync of unchanged upstream content signs nothing new."""
+    url, _ = upstream_repo_factory(["walrus", "zebra"], KEY_V4_RSA2K)
+    repository, _ = sync_signing_repo
+    remote = rpm_rpmremote_factory(url=url)
+
+    repository, _ = init_and_sync(repository=repository, remote=remote)
+    first_version = repository.latest_version_href
+    first_packages = _list_packages(rpm_package_api, repository)
+
+    repository, _, task = init_and_sync(
+        repository=repository, remote=remote, optimize=False, return_task=True
+    )
+
+    assert repository.latest_version_href == first_version
+    assert _list_packages(rpm_package_api, repository) == first_packages
+    assert task.created_resources == []
+
+
+@pytest.mark.parallel
+def test_sign_on_sync_reuses_signing_result_across_repositories(
+    init_and_sync,
+    upstream_repo_factory,
+    signing_gpg_extra,
+    rpm_package_signing_service_resign,
+    rpm_repository_factory,
+    rpm_package_api,
+):
+    """Two repositories signing the same upstream file with one key share the signed package."""
+    url, _ = upstream_repo_factory(["walrus"], KEY_V4_RSA2K)
+    _, key_b = signing_gpg_extra
+    hrefs = []
+    for _ in range(2):
+        repository = rpm_repository_factory(
+            package_signing_service=rpm_package_signing_service_resign.pulp_href,
+            package_signing_fingerprint=f"v4:{key_b.signing_fingerprint.upper()}",
+        )
+        repository, _ = init_and_sync(repository=repository, url=url)
+        hrefs.append(
+            [pkg.pulp_href for pkg in _list_packages(rpm_package_api, repository).values()]
+        )
+    assert hrefs[0] == hrefs[1]
+
+
+@pytest.mark.parallel
+def test_sign_on_sync_replaces_unsigned_copies(
+    init_and_sync,
+    upstream_repo_factory,
+    signing_gpg_extra,
+    rpm_package_signing_service_resign,
+    rpm_repository_factory,
+    rpm_repository_api,
+    rpm_package_api,
+    rpm_rpmremote_factory,
+    monitor_task,
+):
+    """Content synced before signing was enabled is replaced by signed copies on resync."""
+    url, upstream_sha256s = upstream_repo_factory(["walrus", "zebra"], KEY_V4_RSA2K)
+    _, key_b = signing_gpg_extra
+    fingerprint = f"v4:{key_b.signing_fingerprint.upper()}"
+    remote = rpm_rpmremote_factory(url=url)
+    repository, _ = init_and_sync(remote=remote)
+    unsigned = _list_packages(rpm_package_api, repository)
+    assert {name: pkg.pkg_id for name, pkg in unsigned.items()} == upstream_sha256s
+
+    monitor_task(
+        rpm_repository_api.partial_update(
+            repository.pulp_href,
+            {
+                "package_signing_service": rpm_package_signing_service_resign.pulp_href,
+                "package_signing_fingerprint": fingerprint,
+            },
+        ).task
+    )
+    repository, _ = init_and_sync(repository=repository, remote=remote, optimize=False)
+
+    signed = _list_packages(rpm_package_api, repository)
+    assert sorted(signed) == sorted(unsigned)
+    for filename, package in signed.items():
+        assert package.signing_keys == [fingerprint]
+        assert package.pkg_id != upstream_sha256s[filename]
+
+
+@pytest.mark.parallel
+def test_sign_on_sync_keeps_package_already_in_repository(
+    tmp_path,
+    init_and_sync,
+    upstream_repo_factory,
+    sync_signing_repo,
+    rpm_package_api,
+    rpm_repository_api,
+    monitor_task,
+):
+    """A same-NVRA package already in the repository, with other bytes, is kept as is.
+
+    This is how packages that an earlier sync signed, without recording a signing result,
+    keep their bytes when the same upstream package is synced again.
+    """
+    url, _ = upstream_repo_factory(["walrus"], KEY_V4_RSA2K)
+    repository, fingerprint = sync_signing_repo
+
+    # Already signed with the repository's key, so modify adds it unchanged.
+    existing = tmp_path / "walrus-1.0-1.noarch.rpm"
+    build_rpm(Nevra("walrus", 0, "1.0", "1", "noarch"), existing)
+    _sign_package(existing, KEY_V4_RSA4K.private_url)
+    created = monitor_task(rpm_package_api.create(file=str(existing.absolute())).task)
+    (package_href,) = [href for href in created.created_resources if "/packages/" in href]
+    monitor_task(
+        rpm_repository_api.modify(repository.pulp_href, {"add_content_units": [package_href]}).task
+    )
+    repository = rpm_repository_api.read(repository.pulp_href)
+    version_before = repository.latest_version_href
+
+    repository, _ = init_and_sync(repository=repository, url=url)
+
+    assert repository.latest_version_href == version_before
+    assert [pkg.pulp_href for pkg in _list_packages(rpm_package_api, repository).values()] == [
+        package_href
+    ]
+
+
+@pytest.mark.parallel
+def test_sign_on_sync_passes_through_package_signed_with_repository_key(
+    init_and_sync,
+    upstream_repo_factory,
+    sync_signing_repo,
+    rpm_package_api,
+):
+    """An upstream package already signed with the repository's key keeps its bytes."""
+    url, upstream_sha256s = upstream_repo_factory(["walrus"], KEY_V4_RSA4K)
+    repository, fingerprint = sync_signing_repo
+
+    repository, _ = init_and_sync(repository=repository, url=url)
+
+    (package,) = _list_packages(rpm_package_api, repository).values()
+    assert package.pkg_id == upstream_sha256s["walrus-1.0-1.noarch.rpm"]
+    assert package.signing_keys == [fingerprint]
+
+
+@pytest.mark.parallel
+@pytest.mark.parametrize(
+    "sync_kwargs,message",
+    [
+        ({"policy": "on_demand"}, "'immediate' policy"),
+        ({"sync_policy": "mirror_complete"}, "'mirror_complete' sync policy"),
+    ],
+)
+def test_sign_on_sync_rejects_unsupported_policies(
+    sync_kwargs, message, init_and_sync, upstream_repo_factory, sync_signing_repo
+):
+    """Sync into a signing repository needs downloaded packages and Pulp-generated metadata."""
+    url, _ = upstream_repo_factory(["walrus"])
+    repository, _ = sync_signing_repo
+
+    with pytest.raises(ApiException) as exc:
+        init_and_sync(repository=repository, url=url, **sync_kwargs)
+
+    assert exc.value.status == 400
+    assert message in exc.value.body
 
 
 @pytest.mark.parallel

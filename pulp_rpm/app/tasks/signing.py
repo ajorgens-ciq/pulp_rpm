@@ -111,46 +111,61 @@ def _sign_package(package, signing_service, signing_fingerprint):
         # create a new signed version of the package
         log.info(f"Signing package {package.filename}.")
         signed_package_path = _sign_file(final_package, signing_service, signing_fingerprint)
-        # Read signing key fingerprints directly from the signed RPM's signature packets.
-        signing_keys = extract_signing_keys(str(signed_package_path))
-        # Read all updated metadata from the signed RPM
-        parsed_package = read_package_from_file(signed_package_path)
-        new_pkg_dict = Package.rpmrepo_to_dict(parsed_package, signing_keys=signing_keys)
-        artifact = _save_artifact(signed_package_path)
         extra_fields = {}
         if settings.RPM_SIGNING_COPY_LABELS:
             extra_fields["pulp_labels"] = package.pulp_labels
-        signed_package = Package(
-            **new_pkg_dict,
+        signed_package, _ = _create_signed_package(
+            signed_package_path,
+            artifact_obj.sha256,
+            signing_fingerprint,
+            content_artifact.relative_path,
             is_modular=package.is_modular,
             **extra_fields,
         )
-        signed_package.location_href = signed_package.filename
-        signed_package.save()
-        ContentArtifact.objects.create(
-            artifact=artifact,
-            content=signed_package,
-            relative_path=content_artifact.relative_path,
-        )
-        # get_or_create guards against concurrent signing of the same package, which
-        # would otherwise violate the unique constraint and fail the task.
-        signing_result, created = RpmPackageSigningResult.objects.get_or_create(
-            original_package_sha256=artifact_obj.sha256,
-            package_signing_fingerprint=signing_fingerprint,
-            defaults={"result_package": signed_package},
-        )
-        if not created:
-            # Another worker won the race; reuse its result and let orphan cleanup
-            # reap the redundant package we just created.
-            log.info(
-                f"Package {package.filename} was signed concurrently; reusing existing result."
-            )
-            return (package_id, str(signing_result.result_package.pk))
-
-        resource = CreatedResource(content_object=signed_package)
-        resource.save()
-        log.info(f"Signed package {package.filename}.")
         return (package_id, str(signed_package.pk))
+
+
+def _create_signed_package(
+    signed_package_path, original_sha256, signing_fingerprint, relative_path, **package_fields
+):
+    """
+    Save a signed RPM as a new Package and record it as the signing result of the original.
+
+    Returns a (Package, Artifact) tuple. If another worker recorded a result for the same
+    original and fingerprint first, that result is returned instead.
+    """
+    # Read signing key fingerprints directly from the signed RPM's signature packets.
+    signing_keys = extract_signing_keys(str(signed_package_path))
+    # Read all updated metadata from the signed RPM
+    parsed_package = read_package_from_file(signed_package_path)
+    new_pkg_dict = Package.rpmrepo_to_dict(parsed_package, signing_keys=signing_keys)
+    artifact = _save_artifact(signed_package_path)
+    signed_package = Package(**new_pkg_dict, **package_fields)
+    signed_package.location_href = signed_package.filename
+    signed_package.save()
+    ContentArtifact.objects.create(
+        artifact=artifact,
+        content=signed_package,
+        relative_path=relative_path,
+    )
+    # get_or_create guards against concurrent signing of the same package, which
+    # would otherwise violate the unique constraint and fail the task.
+    signing_result, created = RpmPackageSigningResult.objects.get_or_create(
+        original_package_sha256=original_sha256,
+        package_signing_fingerprint=signing_fingerprint,
+        defaults={"result_package": signed_package},
+    )
+    if not created:
+        # Another worker won the race; reuse its result and let orphan cleanup
+        # reap the redundant package we just created.
+        log.info(f"Package {signed_package.filename} was signed concurrently; reusing result.")
+        result_package = signing_result.result_package
+        return result_package, result_package.contentartifact_set.get().artifact
+
+    resource = CreatedResource(content_object=signed_package)
+    resource.save()
+    log.info(f"Signed package {signed_package.filename}.")
+    return signed_package, artifact
 
 
 def sign_and_create(

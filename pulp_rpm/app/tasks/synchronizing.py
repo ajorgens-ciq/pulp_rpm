@@ -5,10 +5,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import uuid
 from collections import defaultdict
 from gettext import gettext as _  # noqa:F401
+from pathlib import Path
 
 import createrepo_c as cr
 import rpmrepo_metadata as rpmmd
@@ -39,6 +41,7 @@ from pulpcore.plugin.stages import (
     DeclarativeArtifact,
     DeclarativeContent,
     DeclarativeVersion,
+    GenericDownloader,
     QueryExistingArtifacts,
     QueryExistingContents,
     RemoteArtifactSaver,
@@ -91,12 +94,17 @@ from pulp_rpm.app.models import (
     Variant,
     safe_subrepo_name_validator,
 )
+from pulp_rpm.app.models.content import RpmPackageSigningResult
 from pulp_rpm.app.modulemd import parse_modular
 from pulp_rpm.app.shared_utils import (
+    extract_signing_keys,
+    format_nvra,
     get_sha256,
     is_previous_version,
+    signing_key_matches,
     urlpath_sanitize,
 )
+from pulp_rpm.app.tasks.signing import _create_signed_package, _sign_file
 
 log = logging.getLogger(__name__)
 
@@ -563,6 +571,7 @@ def synchronize(remote_pk, repository_pk, sync_policy, skip_types, optimize, url
                 repo_sync_results[directory] = repo.latest_version()
                 continue
 
+            sign_packages = should_sign_on_sync(repo, sync_policy)
             stage = RpmFirstStage(
                 remote,
                 repo,
@@ -572,9 +581,12 @@ def synchronize(remote_pk, repository_pk, sync_policy, skip_types, optimize, url
                 new_url=repo_config["url"],
                 treeinfo=(treeinfo if not is_subrepo(directory) else None),
                 namespace=directory,
+                sign_packages=sign_packages,
             )
 
-            dv = RpmDeclarativeVersion(first_stage=stage, repository=repo, mirror=mirror)
+            dv = RpmDeclarativeVersion(
+                first_stage=stage, repository=repo, mirror=mirror, sign_packages=sign_packages
+            )
             repo_version = dv.create() or repo.latest_version()
 
             repo_config["sync_details"]["most_recent_version"] = repo_version.number
@@ -623,17 +635,32 @@ def synchronize(remote_pk, repository_pk, sync_policy, skip_types, optimize, url
         return None
 
 
+def should_sign_on_sync(repository, sync_policy):
+    """
+    Whether a sync re-signs the packages it adds with the repository's signing key.
+
+    Mirror-complete syncs are excluded because they publish the remote's metadata as-is,
+    which would no longer match re-signed packages.
+    """
+    return bool(
+        sync_policy in (SYNC_POLICIES.ADDITIVE, SYNC_POLICIES.MIRROR_CONTENT_ONLY)
+        and repository.package_signing_service
+        and repository.package_signing_fingerprint
+    )
+
+
 class RpmDeclarativeVersion(DeclarativeVersion):
     """
     Subclassed Declarative version creates a custom pipeline for RPM sync.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, sign_packages=False, **kwargs):
         """
         Adding support for ACS.
 
         Adding it here, because we call RpmDeclarativeVersion multiple times in sync.
         """
+        self.sign_packages = sign_packages
         kwargs["acs"] = True
         super().__init__(*args, **kwargs)
 
@@ -659,9 +686,16 @@ class RpmDeclarativeVersion(DeclarativeVersion):
         ]
         if self.acs:
             pipeline.append(ACSArtifactHandler())
+        pipeline.append(ArtifactDownloader(resource_budget=resource_budget))
+        if self.sign_packages:
+            pipeline.append(
+                RpmPackageSigningStage(
+                    self.repository.package_signing_service,
+                    self.repository.package_signing_fingerprint,
+                )
+            )
         pipeline.extend(
             [
-                ArtifactDownloader(resource_budget=resource_budget),
                 ArtifactSaver(resource_budget=resource_budget),
                 QueryExistingContents(),
                 RpmContentSaver(),
@@ -690,6 +724,7 @@ class RpmFirstStage(Stage):
         new_url=None,
         treeinfo=None,
         namespace="",
+        sign_packages=False,
     ):
         """
         The first stage of a pulp_rpm sync pipeline.
@@ -707,6 +742,8 @@ class RpmFirstStage(Stage):
             new_url(str): URL to replace remote url
             treeinfo(dict): Treeinfo data
             namespace(str): Path where this repo is located relative to some parent repo.
+            sign_packages(bool): Whether the pipeline re-signs packages with the repository's
+                signing key.
 
         """
         super().__init__()
@@ -715,6 +752,7 @@ class RpmFirstStage(Stage):
         self.repository = repository
         self.deferred_download = deferred_download
         self.mirror_metadata = mirror_metadata
+        self.sign_packages = sign_packages
 
         # How many directories deep this repo is nested within another repo (if at all).
         # Backwards relative paths that are shallower than this depth are permitted (in mirror
@@ -1403,6 +1441,10 @@ class RpmFirstStage(Stage):
                 return cache
 
             existing_packages = await sync_to_async(_build_existing_packages_cache)()
+            if self.sign_packages:
+                signed_by_pkgid, signed_by_nvra = await sync_to_async(
+                    self._build_signed_package_caches
+                )(checksums, list(existing_packages.values()))
 
             string_cache = {}
             tuple_cache = {}
@@ -1431,7 +1473,30 @@ class RpmFirstStage(Stage):
                 # avoid generating a new empty Package and instead pass the saved one. This avoids
                 # more expensive queries down the line in QueryExistingContents.
                 cached = existing_packages.pop(pkg.pkgId, None)
-                if cached is not None:
+                stand_in = None
+                if self.sign_packages:
+                    stand_in = self._signed_stand_in(pkg, cached, signed_by_pkgid, signed_by_nvra)
+                    if cached is not None and not signing_key_matches(
+                        self.repository.package_signing_fingerprint, cached.signing_keys or []
+                    ):
+                        # Unverified upstream file: let RpmPackageSigningStage check it.
+                        cached = None
+
+                if stand_in is not None:
+                    signed_package, signed_artifact = stand_in
+                    base_url = pkg.location_base or self.remote_url
+                    url = urlpath_sanitize(base_url, pkg.location_href)
+                    last_seen_package_name = pkg.name
+                    del pkg
+                    # No remote: the remote serves the unsigned file, not this artifact.
+                    da = DeclarativeArtifact(
+                        artifact=signed_artifact,
+                        url=url,
+                        relative_path=signed_package.filename,
+                    )
+                    dc = DeclarativeContent(content=signed_package, d_artifacts=[da])
+                    dc.extra_data = defaultdict(list)
+                elif cached is not None:
                     remote_location_href = pkg.location_href
                     base_url = pkg.location_base or self.remote_url
                     url = urlpath_sanitize(base_url, remote_location_href)
@@ -1510,6 +1575,55 @@ class RpmFirstStage(Stage):
 
                 await packages_pb.aincrement()  # TODO: don't do this for every individual package
                 await self.put(dc)
+
+    def _build_signed_package_caches(self, upstream_pkgids, repo_packages):
+        """
+        Find Pulp-signed packages that can be synced in place of upstream packages.
+
+        Returns two dicts of (Package, Artifact) tuples: signing results for this repository's
+        fingerprint keyed by the upstream sha256, and the repository's packages keyed by NVRA.
+        """
+        results = dict(
+            RpmPackageSigningResult.objects.filter(
+                package_signing_fingerprint=self.repository.package_signing_fingerprint,
+                original_package_sha256__in=upstream_pkgids,
+            ).values_list("original_package_sha256", "result_package_id")
+        )
+        result_packages = Package.objects.filter(pk__in=results.values()).defer(
+            "files", "requires", "provides", "changelogs"
+        )
+        packages = {pkg.pk: pkg for pkg in [*result_packages, *repo_packages]}
+        artifacts = {
+            ca.content_id: ca.artifact
+            for ca in ContentArtifact.objects.filter(
+                content_id__in=packages.keys(), artifact__isnull=False
+            ).select_related("artifact")
+        }
+        signed_by_pkgid = {
+            sha256: (packages[pk], artifacts[pk])
+            for sha256, pk in results.items()
+            if pk in artifacts
+        }
+        signed_by_nvra = {
+            pkg.nvra: (pkg, artifacts[pkg.pk]) for pkg in repo_packages if pkg.pk in artifacts
+        }
+        return signed_by_pkgid, signed_by_nvra
+
+    @staticmethod
+    def _signed_stand_in(pkg, cached, signed_by_pkgid, signed_by_nvra):
+        """
+        Pick the Pulp-signed (Package, Artifact) to sync in place of an upstream package.
+
+        The recorded signing result for the upstream file wins. Otherwise the repository's
+        package with the same NVRA is kept, on the assumption that an earlier sync signed it,
+        unless the repository holds the upstream file itself (cached), which still has to be
+        checked by RpmPackageSigningStage.
+        """
+        if pkg.pkgId in signed_by_pkgid:
+            return signed_by_pkgid[pkg.pkgId]
+        if cached is None:
+            return signed_by_nvra.get(format_nvra(pkg.name, pkg.version, pkg.release, pkg.arch))
+        return None
 
     async def parse_advisories(self, result):
         """Parse advisories from the remote repository."""
@@ -1728,3 +1842,78 @@ class RpmContentSaver(ContentSaver):
 
         if update_references_to_save:
             UpdateReference.objects.bulk_create(update_references_to_save, ignore_conflicts=True)
+
+
+def _copy_artifact_to_tempfile(artifact):
+    """Copy a saved artifact out of storage into a local file and return its path."""
+    with (
+        artifact.file.open("rb") as source,
+        tempfile.NamedTemporaryFile("wb", dir=".", suffix=".rpm", delete=False) as target,
+    ):
+        shutil.copyfileobj(source, target)
+    return target.name
+
+
+class RpmPackageSigningStage(GenericDownloader):
+    """
+    Re-sign downloaded packages with the repository's package signing key.
+
+    Runs after ArtifactDownloader. Each new Package is replaced with a signed copy, saved
+    together with its Artifact and recorded as an RpmPackageSigningResult, which later
+    syncs reuse instead of signing again. Packages already signed with the key pass through.
+    """
+
+    PROGRESS_REPORTING_MESSAGE = "Signing Packages"
+    PROGRESS_REPORTING_CODE = "sync.signing.packages"
+
+    def __init__(self, signing_service, signing_fingerprint):
+        super().__init__(max_concurrent_content=settings.MAX_PACKAGE_SIGNING_WORKERS)
+        self.signing_service = signing_service
+        self.signing_fingerprint = signing_fingerprint
+
+    async def _handle_content_unit(self, d_content):
+        signed = 0
+        if isinstance(d_content.content, Package) and d_content.content._state.adding:
+            signed = await self._sign(d_content)
+        await self.put(d_content)
+        return signed
+
+    async def _sign(self, d_content):
+        """Swap in a signed copy of the package. Return 1 if it was signed here, else 0."""
+        (d_artifact,) = d_content.d_artifacts
+        if d_artifact.deferred_download:
+            raise SyncError(_("Packages can only be signed during sync if they are downloaded."))
+        original = d_artifact.artifact
+        if original._state.adding:
+            path = str(original.file)
+        else:
+            path = await sync_to_async(_copy_artifact_to_tempfile)(original)
+        try:
+            signing_keys = await asyncio.to_thread(extract_signing_keys, path)
+            if signing_key_matches(self.signing_fingerprint, signing_keys):
+                # Recorded so that later syncs can reuse the package without re-checking it.
+                d_content.content.signing_keys = signing_keys
+                return 0
+            with open(path, "rb") as package_file:
+                signed_path = await asyncio.to_thread(
+                    _sign_file, package_file, self.signing_service, self.signing_fingerprint
+                )
+            try:
+                d_content.content, d_artifact.artifact = await sync_to_async(
+                    _create_signed_package
+                )(
+                    signed_path,
+                    original.sha256,
+                    self.signing_fingerprint,
+                    d_artifact.relative_path,
+                    is_modular=d_content.content.is_modular,
+                )
+            finally:
+                signed_path.unlink(missing_ok=True)
+        finally:
+            # ArtifactSaver deletes the download only while it is still the artifact to save.
+            if d_artifact.artifact is not original or not original._state.adding:
+                Path(path).unlink(missing_ok=True)
+        # The remote serves the unsigned file, so it is no source for the signed artifact.
+        d_artifact.remote = None
+        return 1
